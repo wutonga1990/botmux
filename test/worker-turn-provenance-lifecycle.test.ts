@@ -81,6 +81,7 @@ function runPromptReady(sandbox: Record<string, any>) {
     shouldFlushInjectionsFirst: () => false,
     flushPending: () => {},
     pendingInjections: [],
+    spawnArgvNeedsWorkingSeed: false,
   };
   const promptStart = workerSource.indexOf('function markPromptReady(): void {');
   const promptEnd = workerSource.indexOf('\nfunction persistCliSessionId(', promptStart);
@@ -93,7 +94,7 @@ function runPromptReady(sandbox: Record<string, any>) {
 
 describe('worker turn provenance lifecycle (#1723)', () => {
   describe('source ordering and wiring checks', () => {
-    it('checks backgroundTaskTracker and busy state BEFORE revoking active turn authority in markPromptReady', () => {
+    it('checks backgroundTaskTracker BEFORE revoking active turn authority in markPromptReady', () => {
       const promptStart = workerSource.indexOf('function markPromptReady(): void');
       const promptEnd = workerSource.indexOf('\nfunction persistCliSessionId(', promptStart);
       expect(promptStart).toBeGreaterThanOrEqual(0);
@@ -107,11 +108,6 @@ describe('worker turn provenance lifecycle (#1723)', () => {
       const bgCheckIdx = promptBody.indexOf('backgroundTaskTracker.pending() > 0');
       expect(bgCheckIdx).toBeGreaterThanOrEqual(0);
       expect(bgCheckIdx).toBeLessThan(revokeIdx);
-
-      // busy / tool execution deferral must also be checked before releaseActiveTurnAuthority
-      const busyDeferIdx = promptBody.indexOf("deferPromptReadyWhileBusy('markPromptReady', backend)");
-      expect(busyDeferIdx).toBeGreaterThanOrEqual(0);
-      expect(busyDeferIdx).toBeLessThan(revokeIdx);
     });
 
     it('propagates revoke reason in completeManagedTurnOriginRevocation and managed_turn_origin_revoked', () => {
@@ -157,7 +153,7 @@ describe('worker turn provenance lifecycle (#1723)', () => {
       });
     });
 
-    it('scenario 2: unfinished background tasks retain turn authority during prompt-ready heuristic', () => {
+    it('scenario 2: unfinished background tasks retain turn authority during prompt-ready heuristic and re-arm working', () => {
       // Reproduce prompt-ready execution with backgroundTaskTracker.pending() === 1
       const events: any[] = [];
       let authorityReleased = false;
@@ -188,15 +184,22 @@ describe('worker turn provenance lifecycle (#1723)', () => {
         backgroundTaskTracker: { pending: () => 1 },
         publishScreenStatus: (status: string) => events.push({ type: 'screen_status', status }),
         log: (msg: string) => events.push({ type: 'log', msg }),
-        backend: null,
-        deferPromptReadyWhileBusy: () => false,
+        backend: { id: 'pty-1' },
+        renderer: { snapshot: () => ({ content: '' }) },
+        pendingMessages: [],
+        pendingAdoptMessages: [],
+        pendingRawInputs: [],
+        pendingSessionRename: null,
+        isFlushing: false,
       };
 
       runPromptReady(sandbox);
 
       // Must NOT release turn authority when background tasks are pending
       expect(authorityReleased).toBe(false);
+      // Screen status must report working, and idle detector must be re-armed
       expect(events).toContainEqual(expect.objectContaining({ type: 'screen_status', status: 'working' }));
+      expect(events).toContain('idle_reset');
 
       // Because authority was NOT released, the session's liveOrigin remains intact
       const liveSession = buildSession({
@@ -206,9 +209,10 @@ describe('worker turn provenance lifecycle (#1723)', () => {
       expect(reportResult.ok).toBe(true);
     });
 
-    it('scenario 3: long synchronous tool call retains turn authority during prompt-ready probe', () => {
+    it('scenario 3: inbound pending messages flush without releasing turn authority while background tasks are pending', () => {
       const events: any[] = [];
       let authorityReleased = false;
+      let flushPendingCalled = false;
 
       const sandbox: Record<string, any> = {
         idleDetector: { isStartupPending: () => false, reset: () => events.push('idle_reset') },
@@ -233,22 +237,31 @@ describe('worker turn provenance lifecycle (#1723)', () => {
           authorityReleased = true;
           events.push({ type: 'release_authority', reason });
         },
-        backgroundTaskTracker: { pending: () => 0 },
+        backgroundTaskTracker: { pending: () => 1 },
         publishScreenStatus: (status: string) => events.push({ type: 'screen_status', status }),
         log: (msg: string) => events.push({ type: 'log', msg }),
         backend: { id: 'pty-1' },
-        // deferPromptReadyWhileBusy returns true because session DB shows running tool
-        deferPromptReadyWhileBusy: (src: string, be: any) => {
-          events.push({ type: 'defer_busy', src });
-          return true;
+        renderer: { snapshot: () => ({ content: '' }) },
+        send: (msg: any) => events.push({ type: 'ipc', msg }),
+        pendingMessages: [{ text: 'inbound message while task pending' }],
+        pendingAdoptMessages: [],
+        pendingRawInputs: [],
+        pendingSessionRename: null,
+        isFlushing: false,
+        flushPending: () => {
+          flushPendingCalled = true;
+          events.push('flush_pending');
         },
       };
 
       runPromptReady(sandbox);
 
-      // Must NOT release turn authority when synchronous tool is running
+      // Must NOT release turn authority
       expect(authorityReleased).toBe(false);
-      expect(events).toContainEqual(expect.objectContaining({ type: 'defer_busy', src: 'markPromptReady' }));
+      // Must flush pending messages to CLI immediately
+      expect(flushPendingCalled).toBe(true);
+      // Must emit prompt_ready IPC to daemon
+      expect(events).toContainEqual(expect.objectContaining({ type: 'ipc', msg: expect.objectContaining({ type: 'prompt_ready' }) }));
 
       // Because authority was NOT released, report relay continues to succeed
       const liveSession = buildSession({

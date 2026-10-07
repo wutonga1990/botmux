@@ -12328,34 +12328,6 @@ function markPromptReady(): void {
     return;
   }
   structuredRejectedReadyEvidenceGeneration = undefined;
-  if (spawnArgvInitialPromptBusy) {
-    spawnArgvInitialPromptBusy = false;
-    spawnArgvNeedsWorkingSeed = false;
-    // Stay non-ready so the next genuine end-of-turn idle is a real edge.
-    isPromptReady = false;
-    idleDetector?.reset();
-    // force: rate-limit banner must not rewrite synthetic working → limited
-    publishScreenStatus('working', { force: true });
-    log('Spawn argv initial prompt still in flight — reporting working (not idle) so turn reactions can settle later');
-    return;
-  }
-  if (backend && deferPromptReadyWhileBusy('markPromptReady', backend)) {
-    return;
-  }
-  if (backgroundTaskTracker.pending() > 0) {
-    // The main turn is only quiet because it dispatched background
-    // sub-agents and is awaiting their `<task-notification>`. Report
-    // working (not idle) so the session card is not frozen to 「已完成」
-    // mid-flight and then re-posted as 「进行中」when the notification
-    // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
-    // spawn-argv branch above) so the genuine end-of-turn idle after the
-    // background work settles is still a real, re-fireable edge.
-    isPromptReady = false;
-    idleDetector?.reset();
-    publishScreenStatus('working');
-    log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
-    return;
-  }
   // Quiescence is the terminal boundary for PTY adapters that do not emit an
   // explicit turn_terminal. Durable receivers keep authority until their exact
   // terminal receipt so an early screen-idle heuristic cannot release it.
@@ -12363,7 +12335,16 @@ function markPromptReady(): void {
   // control channel can accept the opening turn.  It is not an execution
   // terminal for that already-admitted Lark turn, so keep the exact caller
   // authority until the provider later emits final/failure.
-  if (!durableTurnInFlight && !preserveActiveTurnAuthorityForReady) {
+  //
+  // Do not revoke authority when the initial argv-baked prompt is still
+  // in-flight (spawnArgvInitialPromptBusy) or background tasks are still
+  // pending (backgroundTaskTracker.pending() > 0). During these, screen
+  // quiescence is not a turn completion, and running background sub-agents
+  // or tools must keep valid turn provenance for report-relay calls (#1723).
+  const retainActiveTurnAuthorityForWorking =
+    spawnArgvInitialPromptBusy
+    || backgroundTaskTracker.pending() > 0;
+  if (!durableTurnInFlight && !preserveActiveTurnAuthorityForReady && !retainActiveTurnAuthorityForWorking) {
     releaseActiveTurnAuthority('prompt_ready');
   }
   isPromptReady = true;
@@ -12473,7 +12454,16 @@ function markPromptReady(): void {
     || pendingSessionRename !== null
     || isFlushing;
   if (renderer && !hasPendingWork) {
-    if (spawnArgvNeedsWorkingSeed) {
+    if (spawnArgvInitialPromptBusy) {
+      spawnArgvInitialPromptBusy = false;
+      spawnArgvNeedsWorkingSeed = false;
+      // Stay non-ready so the next genuine end-of-turn idle is a real edge.
+      isPromptReady = false;
+      idleDetector?.reset();
+      // force: rate-limit banner must not rewrite synthetic working → limited
+      publishScreenStatus('working', { force: true });
+      log('Spawn argv initial prompt still in flight — reporting working (not idle) so turn reactions can settle later');
+    } else if (spawnArgvNeedsWorkingSeed) {
       // First ready = true completion for quiescence argv adapters. Seed a
       // working edge before idle/limited so daemon finishTurnReactions (gated
       // on working→idle|limited) still flips card-off GoGoGo on cold-start
@@ -12485,6 +12475,18 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
+    } else if (backgroundTaskTracker.pending() > 0) {
+      // The main turn is only quiet because it dispatched background
+      // sub-agents and is awaiting their `<task-notification>`. Report
+      // working (not idle) so the session card is not frozen to 「已完成」
+      // mid-flight and then re-posted as 「进行中」when the notification
+      // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
+      // spawn-argv branch above) so the genuine end-of-turn idle after the
+      // background work settles is still a real, re-fireable edge.
+      isPromptReady = false;
+      idleDetector?.reset();
+      publishScreenStatus('working');
+      log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
     } else {
       publishScreenStatus('idle');
     }
