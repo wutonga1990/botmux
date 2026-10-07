@@ -3421,7 +3421,7 @@ function releaseActiveTurnAuthority(
     sandboxRelayCapability,
     released.turnId,
     released.dispatchAttempt,
-    { revokePolicy: false },
+    { revokePolicy: false, reason },
   );
   log(`Released active turn authority ${released.turnId?.slice(0, 12) ?? '-'} (${reason})`);
   queueMicrotask(() => { void flushPending(); });
@@ -3508,6 +3508,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       sandboxRelayCapability,
       authorityTurnId,
       authorityDispatchAttempt,
+      { reason: 'publish_error' },
     );
     if (opts.failClosed) throw publishError;
     return false;
@@ -3553,7 +3554,7 @@ function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
-  opts: { revokePolicy?: boolean } = {},
+  opts: { revokePolicy?: boolean; reason?: string } = {},
 ): void {
   // Clear local authority before queuing daemon IPC. A forked/delayed process
   // can otherwise win the small window between terminal publication and
@@ -3573,6 +3574,7 @@ function completeManagedTurnOriginRevocation(
         : {}),
       ...(turnId ? { turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(opts.reason ? { reason: opts.reason } : {}),
     });
   }
   unlinkManagedOriginCapabilityFiles();
@@ -3595,7 +3597,7 @@ function revokeManagedTurnOriginForRestart(): void {
     revoked,
     activeIdentity.turnId ?? currentBotmuxTurnId,
     activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt,
-    { revokePolicy: false },
+    { revokePolicy: false, reason: 'restart' },
   );
 }
 
@@ -12326,6 +12328,34 @@ function markPromptReady(): void {
     return;
   }
   structuredRejectedReadyEvidenceGeneration = undefined;
+  if (spawnArgvInitialPromptBusy) {
+    spawnArgvInitialPromptBusy = false;
+    spawnArgvNeedsWorkingSeed = false;
+    // Stay non-ready so the next genuine end-of-turn idle is a real edge.
+    isPromptReady = false;
+    idleDetector?.reset();
+    // force: rate-limit banner must not rewrite synthetic working → limited
+    publishScreenStatus('working', { force: true });
+    log('Spawn argv initial prompt still in flight — reporting working (not idle) so turn reactions can settle later');
+    return;
+  }
+  if (backend && deferPromptReadyWhileBusy('markPromptReady', backend)) {
+    return;
+  }
+  if (backgroundTaskTracker.pending() > 0) {
+    // The main turn is only quiet because it dispatched background
+    // sub-agents and is awaiting their `<task-notification>`. Report
+    // working (not idle) so the session card is not frozen to 「已完成」
+    // mid-flight and then re-posted as 「进行中」when the notification
+    // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
+    // spawn-argv branch above) so the genuine end-of-turn idle after the
+    // background work settles is still a real, re-fireable edge.
+    isPromptReady = false;
+    idleDetector?.reset();
+    publishScreenStatus('working');
+    log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
+    return;
+  }
   // Quiescence is the terminal boundary for PTY adapters that do not emit an
   // explicit turn_terminal. Durable receivers keep authority until their exact
   // terminal receipt so an early screen-idle heuristic cannot release it.
@@ -12443,16 +12473,7 @@ function markPromptReady(): void {
     || pendingSessionRename !== null
     || isFlushing;
   if (renderer && !hasPendingWork) {
-    if (spawnArgvInitialPromptBusy) {
-      spawnArgvInitialPromptBusy = false;
-      spawnArgvNeedsWorkingSeed = false;
-      // Stay non-ready so the next genuine end-of-turn idle is a real edge.
-      isPromptReady = false;
-      idleDetector?.reset();
-      // force: rate-limit banner must not rewrite synthetic working → limited
-      publishScreenStatus('working', { force: true });
-      log('Spawn argv initial prompt still in flight — reporting working (not idle) so turn reactions can settle later');
-    } else if (spawnArgvNeedsWorkingSeed) {
+    if (spawnArgvNeedsWorkingSeed) {
       // First ready = true completion for quiescence argv adapters. Seed a
       // working edge before idle/limited so daemon finishTurnReactions (gated
       // on working→idle|limited) still flips card-off GoGoGo on cold-start
@@ -12464,18 +12485,6 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
-    } else if (backgroundTaskTracker.pending() > 0) {
-      // The main turn is only quiet because it dispatched background
-      // sub-agents and is awaiting their `<task-notification>`. Report
-      // working (not idle) so the session card is not frozen to 「已完成」
-      // mid-flight and then re-posted as 「进行中」when the notification
-      // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
-      // spawn-argv branch above) so the genuine end-of-turn idle after the
-      // background work settles is still a real, re-fireable edge.
-      isPromptReady = false;
-      idleDetector?.reset();
-      publishScreenStatus('working');
-      log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
     } else {
       publishScreenStatus('idle');
     }
@@ -19213,7 +19222,7 @@ async function spawnCli(
       sandboxRelayCapability,
       exitedTurnId,
       exitedDispatchAttempt,
-      { revokePolicy: false },
+      { revokePolicy: false, reason: 'cli_exit' },
     );
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
     if (lastInitConfig?.cliId === 'codex-app' && codexAppControlFatal) {
@@ -19608,7 +19617,7 @@ function killCli(opts: {
     sandboxRelayCapability,
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
-    { revokePolicy: !opts.preservePolicyCapability },
+    { revokePolicy: !opts.preservePolicyCapability, reason: 'kill_cli' },
   );
   // Stop the sandbox outbox watcher, then reclaim the deny-mask mountpoints +
   // remove the per-session sandbox tree. In the fs-policy model the CLI writes

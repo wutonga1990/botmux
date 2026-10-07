@@ -16191,6 +16191,11 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin_revoked with mismatched sessionId`);
           break;
         }
+        logger.info(
+          `[${t}] Managed turn origin revoked: turn=${msg.turnId?.slice(0, 12) ?? '-'} ` +
+          `attempt=${msg.dispatchAttempt ?? '-'} gen=${ds.workerGeneration} ` +
+          `reason=${msg.reason ?? 'unspecified'}`,
+        );
         // Keep the daemon-authenticated schedule creator until the exact
         // turn_terminal edge. A fresh TUI can report its initial idle prompt
         // before the opening scheduled input is written; the worker then

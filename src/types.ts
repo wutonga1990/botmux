@@ -2081,7 +2081,7 @@ export type WorkerToDaemon =
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
    * has already published a fresh token. */
-  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin_revoked'; sessionId: string; reason?: string; capability?: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   | {
       type: 'codex_app_dispatch_transition';
       sessionId: string;
